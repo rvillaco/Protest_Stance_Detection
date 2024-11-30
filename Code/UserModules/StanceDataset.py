@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """
+Created on Thu Dec  9 15:53:10 2021
+
+@author: rvillaco
 """
 
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -8,6 +11,145 @@ from transformers import PreTrainedTokenizer
 import torch
 import pandas as pd
 
+################################ Tweet level Classification Dataset ################################
+@dataclass
+class TweetDatasetConfig:
+    """
+    Configuration for the preprocessing of the stance dataset.
+    """
+    user_file_name: str = field(
+        metadata={"help": "Path to file containing stance dataset."}
+    )
+    tokenizer: PreTrainedTokenizer =  field(
+                    metadata={"help": "Transformer Tokenizer."}
+    )    
+    max_seq_length: int =  field(
+        default = None, metadata={"help": "Maximum sequence lenght for the model."}
+    )
+    interaction_categories: list =  field(
+        default_factory = ['Original', 'Quote', 'Reply'], metadata={"help": "Possible tweet types, based on their interaction (eg: 'Original', 'Reply', etc.). Must include '<pad>' and <cls>' token."}
+    )
+    label_column: str =  field(
+        default = None, metadata={"help": "Column name in Stance Dataset file that contains the user stance label."}
+    )
+    tweet_label_column: str =  field(
+        default = 'tweet_government_stance', metadata={"help": "Column name in Stance Dataset file that contains the user stance label."}
+    )
+    keep_all_tweets: bool =  field(
+        default = False, metadata={"help": "Whether to maintain all user tweets or only the one that had a weak label."}
+    )    
+    
+    def __post_init__(self):
+        if self.max_seq_length is None:    self.max_seq_length = self.tokenizer.model_max_length
+
+            
+class TweetDataset(Dataset):
+    def __init__(self, config: TweetDatasetConfig):
+
+        self.tokenizer = config.tokenizer 
+        self.config = config
+        
+        # Load Dataframe
+        Tweet_DF = pd.read_csv(config.user_file_name, dtype = {'tweet_id': 'Int64', 'user_id': str})
+        # Encode Interaction Type
+        Tweet_DF['interaction_type'] = pd.Categorical(Tweet_DF.interaction_type, categories = config.interaction_categories)
+        Tweet_DF['interaction_type'] = Tweet_DF.interaction_type.cat.codes
+        
+        
+        if config.label_column is not None:        
+            Tweet_DF = Tweet_DF.rename(columns = {config.label_column: 'user_stance', config.tweet_label_column: 'tweet_stance'})
+
+            if not config.keep_all_tweets: # Just keep weak labeled tweets
+                Tweet_DF = Tweet_DF[Tweet_DF.tweet_stance != -1]
+
+            # Get Tweet weights
+            twStance = Tweet_DF.groupby('user_stance').tweet_id.count().reset_index().rename(columns = {'tweet_id': 'counts'})
+            twStance['weights'] = len(twStance) / twStance['counts']
+            Tweet_DF = pd.merge(Tweet_DF, twStance[['user_stance', 'weights']], on = 'user_stance').reset_index(drop = True)
+
+            # Define Sampling weights
+            self.label_info = {'class_count': len(twStance), 'min_class_count': twStance.counts.min()}
+            self.weights = torch.DoubleTensor(Tweet_DF.weights.values)
+        
+        else:
+            assert config.keep_all_tweets, 'If no labels are provided, the dataset must keep all tweets'
+            Tweet_DF['user_stance'] = None
+            self.weights = None
+            
+        # Define parameters
+        self.ids = Tweet_DF.tweet_id.values
+        self.labels = Tweet_DF.user_stance.values
+        self.text = Tweet_DF.text.values
+        self.interaction_type = Tweet_DF.interaction_type.values       
+           
+    def __len__(self):
+        return len(self.ids)
+    
+    def __getitem__(self, item):
+        return self.ids[item], self.text[item], self.interaction_type[item], self.labels[item]    
+    
+    def _Tweet_datacollator(self, data_batch): # Could produce problems of memory overflow in multiprocessing (not sure if the self reference will cause duplication of the dataset) 
+        # TODO: if it doest work for multiprocessing make it take tokenizer as a parameter
+        ''' 
+        Collate Batches of observations given by this dataset. 
+            data_batch: List of Dictionaries as produced by self.__getitem__
+        '''
+        # If __getitem__ returned a mapping we could use: {key: default_collate([d[key] for d in batch]) for key in elem} # (but I think is slower)
+        # Transpose the Batched Input
+        batched_ids, batched_text, interaction_types, labels = zip(*data_batch)
+
+        batched_examples = self.tokenizer.batch_encode_plus(
+                                      list(batched_text),
+                                      add_special_tokens = True,
+                                      max_length = self.config.max_seq_length,
+                                      return_token_type_ids = False,
+                                      padding = True, # 'max_length', # We can use this parameter if we want to padd to the maximum model size
+                                      return_attention_mask=True,
+                                      return_tensors='pt',
+                                      truncation = 'longest_first'
+                                        )
+        
+        # Resolve Label
+        if labels[0] is None: # We could be working with unlabeled data
+            labels = None
+        else:
+            labels = torch.tensor(labels).long()        
+
+        return {
+            'batched_ids': batched_ids,
+            'input_ids': batched_examples['input_ids'],
+            'attention_mask': batched_examples['attention_mask'],
+            'interaction_types': torch.tensor(interaction_types).long(),         
+            'labels': labels  
+        }    
+    
+    def _Balanced_sampler(self, num_samples: int = None, replacement: bool = False, generator = None):
+        '''
+        This sampler can be provided to the data_loader to produce balanced labeled samples.
+
+        Parameters
+        ----------
+        num_samples : int, optional
+            Number of samples to retrieve. If None, then the sampler will retrieve the minimum class number times the number of classes. The default is None.
+        replacement : bool, optional
+            Whether to sample with replacement. The default is False.
+
+        Returns
+        -------
+        torch.utils.data.WeightedRandomSampler.
+
+        '''
+        if num_samples is None:
+            finalN = self.__len__() if replacement else int(self.label_info['class_count'] * self.label_info['min_class_count'])
+        else:
+            finalN =  num_samples
+        return WeightedRandomSampler(weights = self.weights, num_samples = finalN, replacement = replacement, generator=generator)
+
+    
+
+
+
+################################ User level Classification Dataset ################################
 @dataclass
 class StanceDatasetConfig:
     """
@@ -209,4 +351,44 @@ class StanceDataset(Dataset):
         attention_mask = attention_mask.unsqueeze(0)
         interaction_types = interaction_types.unsqueeze(0)
         return user_id, input_ids, attention_mask, interaction_types, tweet_mask, target, max_tweet_length, num_user_tweets
+
+
+class EmbeddingDataset(Dataset):
+    '''
+    Dataset used when working with pretrained user embeddings resulting from a User_Stance_Classifier
+    '''
+    def __init__(self, user_labels_file, embedding_file, label_column = 'true_label'):
+        self.User_DF = pd.read_csv(user_labels_file, dtype = {'user_id': str})
+        userEmbeddings = torch.load(embedding_file, weights_only=False)
+        
+        # Manage Label Column
+        if label_column is not None:
+            self.User_DF = self.User_DF.rename(columns = {label_column :'user_stance'})            
+        else:
+            self.User_DF['user_stance'] = None
+           
+        # Define parameters
+        self.ids = self.User_DF.user_id.values
+        self.labels = self.User_DF.user_stance.values
+        self.embeddings = userEmbeddings
+           
+    def __len__(self):
+        return len(self.ids)
     
+    def __getitem__(self, item):
+        return self.ids[item], self.embeddings[item], self.labels[item]    
+
+    def _embedding_datacollator(self, data_batch): # Could produce problems of memory overflow in multiprocessing (not sure if the self reference will cause duplication of the dataset) 
+        # TODO: if it doest work for multiprocessing make it take tokenizer as a parameter
+        ''' 
+        Collate Batches of observations given by this dataset. 
+            data_batch: List of Dictionaries as produced by self.__getitem__
+        '''
+        batched_ids, batched_embs, labels = zip(*data_batch)
+
+        return {
+            'batched_ids': batched_ids,
+            'user_embeddings': torch.stack(batched_embs, dim = 0), 
+            'labels': torch.tensor(labels).long()  
+        }
+

@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
+Created on Thu Dec  9 15:59:12 2021
+
+@author: rvillaco
 """
 
 import torch
 import torch.nn as nn
 from transformers import RobertaModel
-from .ModelConfiguration import RoBERTaEncoderConfig, ModelEmbeddingsConfig, UserEncoderConfig
-
+from .ModelConfiguration import RoBERTaEncoderConfig, ModelEmbeddingsConfig, UserEncoderConfig, TweetClassifierConfig
+# Load model directly
+from transformers import AutoModelForMaskedLM
 
 ##################### Define User Classification Modules #####################
 
@@ -53,7 +57,7 @@ class FastText_Embedder(nn.Module):
 class RoBETO_Embedder(nn.Module):
     def __init__(self, config: RoBERTaEncoderConfig):      
         super().__init__()
-        self.RoBETO = RobertaModel.from_pretrained(config.Model_Dir, add_pooling_layer = False)
+        self.RoBETO = AutoModelForMaskedLM.from_pretrained("Ramavill/twBETO_v0").roberta
         
         self.hidden_size = self.RoBETO.config.hidden_size  
         self.FC = nn.Linear(self.hidden_size, self.hidden_size)
@@ -211,7 +215,7 @@ class User_Encoder(nn.Module):
         # Add the cls token to the tweet_masks (this is ugly) 
         # TODO: I should probably change the Stance_Dataset so that the CLS token is included in the interaction_types and the mask is updated there (then I could remove this and the iter_type part in the Model_Embedder_v*). This does make the input dimension of the input_ids to be different from the other two tensors (which is still ugly).
         one_batch = torch.ones(batch_size, 1, device = device, dtype = torch.long)
-        tm = torch.cat((one_batch, tweet_masks), dim =1)
+        tm = torch.cat((one_batch, tweet_masks), dim =1).bool() # Made it BoolTensor as new Transformer version requires this type
         
         # Encode Batch of Tweets per User
         x = self.tweet_encoder(input_ids, attention_mask, interaction_types, tm) # size() = [batch size, batch_tw_per_user + 1, emb dim]
@@ -243,3 +247,73 @@ class User_Stance_Classifier(nn.Module):
         user_emb = self.user_embedder(input_ids, attention_mask, interaction_types, tweet_masks)
         output = self.out_fc(user_emb)
         return output, user_emb
+
+class User_Embedding_Classifier(nn.Module):
+    '''
+    Replicates the behavior of the User_Stance_Classifier when provided by the user embeddings created before the final classification head.
+    
+    '''
+    def __init__(self, num_classes, user_config: UserEncoderConfig):
+        super(User_Embedding_Classifier, self).__init__()
+        user_embedder = User_Encoder(user_config)
+        
+        self.out_fc = nn.Linear(user_embedder.embedding_dim, num_classes)
+        del(user_embedder)
+        nn.init.xavier_uniform_(self.out_fc.weight)
+        
+    def forward(self, user_embeddings):
+        """
+        Arguments:
+        user_embeddings -- User embeddings created by the User_Stance_Classifier
+        """               
+        output = self.out_fc(user_embeddings)
+        return output
+
+    def load_weights_from_User_Stance_Classifier(self, user_classifier_state_dict):
+        """
+        Load weights from a trained instance of a User_Stance_Classifier
+        """
+        dict2_load = {k: v for k, v in user_classifier_state_dict['model_state_dict'].items() if k in self.state_dict()}
+        self.load_state_dict(dict2_load) 
+       
+
+    
+################## Tweet Classification Head ##################
+
+class Tweet_Stance_Classifier(torch.nn.Module):
+    def __init__(self, config: TweetClassifierConfig):
+        super(Tweet_Stance_Classifier, self).__init__()
+        self.config = config
+        self.tweet_embedder = RoBETO_Embedder(config.tweet_encoder_config)
+        self.hidden_size = self.tweet_embedder.hidden_size
+        
+        if config.include_type_embeddings:
+            self.type_embedding = torch.nn.Embedding(num_embeddings = config.tweet_type_number,
+                                               embedding_dim = self.hidden_size,
+                                               max_norm = 1.0)            
+            self.LayerNorm = torch.nn.LayerNorm(self.hidden_size, eps = config.layer_norm_eps)
+            self.dropout = torch.nn.Dropout(config.dropout)                 
+        
+        self.out_fc = torch.nn.Linear(self.hidden_size, config.num_classes)
+        torch.nn.init.xavier_uniform_(self.out_fc.weight)
+        
+    def forward(self, input_ids, attention_mask, interaction_types):
+        """
+        Arguments:
+        input_ids -- Tokenized batch of user tweets. Dimension: [batch_size * batch_tweet_number, max_batch_seq_length]
+        attention_mask -- Batch of Input Padding Masks. Dimension: [batch_size * batch_tweet_number, max_batch_seq_length]
+        interaction_types -- Interaction types of the tweets in the batch. Dimension: [batch_size, 1]
+        """               
+        twt_emb = self.tweet_embedder(input_ids, attention_mask)
+        
+        if self.config.include_type_embeddings:
+            type_emb = self.type_embedding(interaction_types) # (batch_size, hidden_size)
+            final_emb = type_emb + twt_emb
+            final_emb = self.LayerNorm(final_emb)
+            final_emb = self.dropout(final_emb)            
+        
+            output = self.out_fc(final_emb)
+            return output, final_emb
+        else:
+            output = self.out_fc(twt_emb)
+            return output, twt_emb
